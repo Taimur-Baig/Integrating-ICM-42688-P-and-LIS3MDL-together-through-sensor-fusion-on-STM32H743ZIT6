@@ -186,15 +186,39 @@ ICM42688_ConfigureSensor(&imu_handle);
 
 /* ── Gyro Z calibration ────────────────────────────────────────────────*/
 printf("Calibrating Gyroscope... DO NOT MOVE!\r\n");
-float gz_offset = 0.0f;
-for (int i = 0; i < 200; i++) {          // More samples = better offset
+// ── Gyro Z calibration (also calibrate X and Y while we're here) ──────
+printf("Calibrating Gyroscope... DO NOT MOVE!\r\n");
+float gx_offset = 0.0f, gy_offset = 0.0f, gz_offset = 0.0f;
+float ax_avg = 0.0f, ay_avg = 0.0f, az_avg = 0.0f;  // to detect board orientation
+
+for (int i = 0; i < 200; i++) {
     int16_t t, ax, ay, az, gx, gy, gz;
-    if (ICM42688_ReadTempAccelGyro(&imu_handle, &t, &ax, &ay, &az, &gx, &gy, &gz) == HAL_OK)
+    if (ICM42688_ReadTempAccelGyro(&imu_handle, &t, &ax, &ay, &az, &gx, &gy, &gz) == HAL_OK) {
+        gx_offset += (gx / 16.4f);
+        gy_offset += (gy / 16.4f);
         gz_offset += (gz / 16.4f);
+        ax_avg += (ax / 4096.0f);  // in g
+        ay_avg += (ay / 4096.0f);
+        az_avg += (az / 4096.0f);
+    }
     HAL_Delay(5);
 }
+gx_offset /= 200.0f;
+gy_offset /= 200.0f;
 gz_offset /= 200.0f;
-printf("Gyro Z Offset: %.4f dps\r\n", gz_offset);
+ax_avg    /= 200.0f;
+ay_avg    /= 200.0f;
+az_avg    /= 200.0f;
+
+printf("Gyro offsets: GX=%.3f GY=%.3f GZ=%.3f dps\r\n", gx_offset, gy_offset, gz_offset);
+printf("Accel at rest: AX=%.3fg AY=%.3fg AZ=%.3fg\r\n", ax_avg, ay_avg, az_avg);
+printf(">>> Gravity should read ~1.0g on ONE axis only.\r\n");
+printf(">>> If AZ~=+1 : board is flat, chip-side UP   (standard)\r\n");
+printf(">>> If AZ~=-1 : board is flat, chip-side DOWN (flip az sign)\r\n");
+printf(">>> If AX~=+1 : board is on its left edge\r\n");
+printf(">>> If AX~=-1 : board is on its right edge\r\n");
+printf(">>> If AY~=+1 : board is on its front edge\r\n");
+printf(">>> If AY~=-1 : board is on its back edge\r\n");
 
 /* Initialize LIS3MDL */
 LIS3MDL_Handle_t mag_handle;
@@ -223,9 +247,12 @@ LIS3MDL_ConfigureSensor(&mag_handle);
     while (HAL_GetTick() < t_end) {
         float mx, my, mz;
         if (LIS3MDL_ReadMagneticField(&mag_handle, &mx, &my, &mz) == HAL_OK) {
-            if (mx < mx_min){ mx_min = mx;  if (mx > mx_max) mx_max = mx;};
-            if (my < my_min){ my_min = my;  if (my > my_max) my_max = my;};
-            if (mz < mz_min){ mz_min = mz;  if (mz > mz_max) mz_max = mz;};
+            if (mx < mx_min) mx_min = mx;  
+            if (mx > mx_max) mx_max = mx;
+            if (my < my_min) my_min = my;
+            if (my > my_max) my_max = my;
+            if (mz < mz_min) mz_min = mz;  
+            if (mz > mz_max) mz_max = mz;
         }
         HAL_Delay(20);
     }
@@ -253,10 +280,9 @@ printf("=== Fusion Loop Starting ===\r\n");
 
    /* USER CODE BEGIN 3 */
 
-    // ── FIXED: Measure actual elapsed time, don't assume ──────────────
     uint32_t now = HAL_GetTick();
-    float dt = (now - last_tick) / 1000.0f;   // real dt in seconds
-    if (dt <= 0.0f || dt > 1.0f) dt = 0.01f;  // sanity clamp
+    float dt = (now - last_tick) / 1000.0f;
+    if (dt <= 0.0f || dt > 1.0f) dt = 0.01f;
     last_tick = now;
 
     int16_t temp_raw, ax_raw, ay_raw, az_raw, gx_raw, gy_raw, gz_raw;
@@ -273,12 +299,12 @@ printf("=== Fusion Loop Starting ===\r\n");
     if (LIS3MDL_ReadMagneticField(&mag_handle, &mag_x_uT, &mag_y_uT, &mag_z_uT) == HAL_OK) {
         mag_ok = 1;
 
-        // ── Apply hard-iron correction FIRST ──────────────────────────
+        // Apply hard-iron correction FIRST (before anything else)
         mag_x_uT -= mag_offset_x;
         mag_y_uT -= mag_offset_y;
         mag_z_uT -= mag_offset_z;
 
-        // Low-pass filter
+        // Low-pass filter on corrected values
         if (!mag_filter_init) {
             mag_x_filt = mag_x_uT;
             mag_y_filt = mag_y_uT;
@@ -297,51 +323,72 @@ printf("=== Fusion Loop Starting ===\r\n");
 
     if (imu_ok && mag_ok)
     {
-        // Convert to engineering units
-        float ax = (ax_raw / 4096.0f) * 9.80665f;
-        float ay = (ay_raw / 4096.0f) * 9.80665f;
-        float az = (az_raw / 4096.0f) * 9.80665f;
-        float gx_dps = gx_raw / 16.4f;
-        float gy_dps = gy_raw / 16.4f;
-        float gz_dps = (gz_raw / 16.4f) - gz_offset;
+        // Convert IMU to engineering units
+       // Convert to engineering units
+float ax = (ax_raw / 4096.0f);   // keep in 'g' — cleaner for atan2
+float ay = (ay_raw / 4096.0f);
+float az = (az_raw / 4096.0f);
+float gx_dps = (gx_raw / 16.4f) - gx_offset;   // ← subtract X bias too
+float gy_dps = (gy_raw / 16.4f) - gy_offset;   // ← subtract Y bias too
+float gz_dps = (gz_raw / 16.4f) - gz_offset;
 
-        // Pitch & Roll from accelerometer
-        float accel_pitch = atan2f(ay, sqrtf(ax*ax + az*az)) * 57.29578f;
-        float accel_roll  = atan2f(-ax, az) * 57.29578f;
+// ── Axis sanity clamp — reject spikes from SPI glitches ──────────────
+// If accel magnitude is way off 1g, skip this frame
+float accel_mag = sqrtf(ax*ax + ay*ay + az*az);
+if (accel_mag < 0.5f || accel_mag > 2.0f) {
+    HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
+    HAL_Delay(10);
+    continue;
+}
 
-        // Kalman update for pitch & roll
-        Kalman_Update(&kalman_pitch, accel_pitch, gy_dps, dt);
-        Kalman_Update(&kalman_roll,  accel_roll,  gx_dps, dt);
+// ── Standard flat-mount formulas (AZ reads +1g when board is flat) ───
+// If your board is mounted differently, swap/negate axes here.
+float accel_pitch = atan2f(-ax, sqrtf(ay*ay + az*az)) * 57.29578f;
+float accel_roll  = atan2f( ay, az)                   * 57.29578f;
 
-        // Tilt compensation — CORRECTED formula
+// Kalman update — gyro axes must match the physical rotation axis
+// Pitch (nose up/down) is rotation around board Y → driven by gy
+// Roll  (wing tilt)    is rotation around board X → driven by gx
+Kalman_Update(&kalman_pitch, accel_pitch, gy_dps, dt);
+Kalman_Update(&kalman_roll,  accel_roll,  gx_dps, dt);
+
         float pitch_rad = kalman_pitch.angle * 0.01745329f;
         float roll_rad  = kalman_roll.angle  * 0.01745329f;
 
         float cos_p = cosf(pitch_rad), sin_p = sinf(pitch_rad);
         float cos_r = cosf(roll_rad),  sin_r = sinf(roll_rad);
 
-        float mx_comp =  mag_x_uT * cos_p
-                       + mag_y_uT * sin_r * sin_p
-                       + mag_z_uT * cos_r * sin_p;
+        // Tilt-compensated magnetometer components
+        float mx_comp = mag_x_uT * cos_p
+                      + mag_y_uT * sin_r * sin_p
+                      + mag_z_uT * cos_r * sin_p;
 
-        float my_comp =  mag_y_uT * cos_r
-                       - mag_z_uT * sin_r;          // ← corrected sign
+        float my_comp = mag_y_uT * cos_r
+                      - mag_z_uT * sin_r;
 
-        // Magnetic heading
-        float mag_yaw = atan2f(-my_comp, mx_comp) * 57.29578f;
-        mag_yaw = NormalizeAngle(mag_yaw);
+        // ── RAW MAG YAW: hard-iron corrected + tilt-compensated, NO Kalman ──
+        // This tells you exactly how good your magnetometer calibration is.
+        // If this is noisy/drifty, your hard-iron offsets need refinement.
+        // If this is clean, Kalman is working correctly on top of it.
+        float yaw_raw_mag = atan2f(-my_comp, mx_comp) * 57.29578f;
+        yaw_raw_mag = NormalizeAngle(yaw_raw_mag);
 
-        // Kalman update for yaw
+        // ── FUSED YAW: Kalman filter blending mag heading + gyro rate ──
+        float mag_yaw = yaw_raw_mag; // reuse — already computed above
         Kalman_Update(&kalman_yaw, mag_yaw, gz_dps, dt);
 
-        printf("PITCH:%.2f, ROLL:%.2f, YAW_FILT:%.2f, Max:180.0, Min:-180.0\r\n",
-               kalman_pitch.angle, kalman_roll.angle, kalman_yaw.angle);
+        // Two yaw streams so you can compare them directly in your plotter:
+        //   YAW_MAG  = magnetometer only (calibrated + tilt-compensated)
+        //   YAW_FILT = Kalman-fused result
+        printf("PITCH:%.2f,ROLL:%.2f,YAW_MAG:%.2f,YAW_FILT:%.2f,Max:180.0,Min:-180.0\r\n",
+               kalman_pitch.angle, kalman_roll.angle,
+               yaw_raw_mag, kalman_yaw.angle);
     }
 
     HAL_GPIO_TogglePin(LED1_GPIO_Port, LED1_Pin);
     HAL_Delay(10);
     /* USER CODE END 3 */
-}
+  }
 }
 
 /**
